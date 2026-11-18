@@ -21,13 +21,14 @@
 %             afterpulse-t indíthat.
 %   Sifting:  csak a koincidenciás (mindkét oldalon pontosan egy klikk) ÉS egyező
 %             bázisú párok maradnak
+%   Utófeldolgozás
 
 clear; clc; rng('shuffle');
 
 %% Paraméterek
 f_rep        = 1e6;     % órajel [Hz] (1 MHz-en a következő kapu 1 us múlva nyílik,
                         % addigra a tau_ap = 100 ns-os afterpulse lecseng)
-T_sim        = 1;       % szimulált idő [s]
+T_sim        = 10;       % szimulált idő [s]
 chunk_pulses = 1e6;     % egy blokk mérete (memória/sebesség tradeoff)
 
 dt       = 1 / f_rep;   % pulzusperiódus [s]
@@ -57,6 +58,14 @@ p_ap        = [0.05, 0.05;      % P(egy lavina csapdába ejt egy töltéshordoz�
 tau_ap      = 100e-9;           % a csapdázott töltéshordozó élettartama [s]
 
 assert(T_gate <= dt, 'A kapu (T_gate) nem lehet hosszabb a pulzusperiódusnál.');
+
+%% Utófeldolgozás — paraméter
+v_pe    = 0.5;          % a paraméterbecslésre feláldozott hányad (előadás: BB84-nél a fele)
+Q_tol   = 0.11;         % QBER-küszöb: e fölött a protokoll leáll
+eps_pe  = 1e-10;        % P(a maradék bitek QBER-je meghaladja a becsült felső korlátot)
+n_frame = 1e4;          % a Cascade egy frame-jének hossza [bit]
+n_pass  = 4;            % Cascade körök száma
+t_conf  = 64;           % a megerősítő hash hossza [bit]
 
 %% Állapot (forrás)
 ket0 = [1; 0];
@@ -203,6 +212,8 @@ tot_src      = zeros(4, 3);         % detektor x forrás (1 = jel, 2 = sötét, 
 last_click   = -inf(1, 4);          % holtidő-állapot: utolsó klikk abszolút ideje
 ap_pending   = repmat({zeros(1,0)}, 1, 4);   % függő felszabadulások abszolút ideje detektoronként
 det_nev      = {'Alice D0', 'Alice D1', 'Bob D0', 'Bob D1'};
+key_a        = cell(1, N_chunks);   % Alice és Bob siftelt kulcsa chunkonként
+key_b        = cell(1, N_chunks);
 
 fprintf('\nIndulás: %d pár (%g s @ %g GHz), %d chunk\n', ...
     N_total, T_sim, f_rep/1e9, N_chunks);
@@ -350,6 +361,8 @@ for c = 1:N_chunks
     tot_sifted   = tot_sifted + nnz(sift);
     tot_errors   = tot_errors + nnz(alice_bits(sift) ~= bob_bits(sift));
     tot_n0       = tot_n0 + nnz(bob_bits(sift) == 0);
+    key_a{c}     = alice_bits(sift) == 1;
+    key_b{c}     = bob_bits(sift) == 1;
 
     % bázisonként is: a bit-flip csak a Z bázisban okoz hibát
     for b = 1:2
@@ -433,3 +446,170 @@ fprintf('QBER:   %.4f%%  (várt a mért klikkekből: %.4f%%)\n', 100*QBER, 100*Q
 fprintf('  Z-ben: %.4f%%  (várt: %.4f%%)\n', 100*QBER_b(1), 100*QBER_v_b(1));
 fprintf('  X-ben: %.4f%%  (várt: %.4f%%)\n', 100*QBER_b(2), 100*QBER_v_b(2));
 fprintf('Bias: P(0) = %.6f\n', tot_n0 / max(tot_sifted, 1));
+
+%% Utófeldolgozás
+% A klasszikus csatornát hitelesítettnek tekintjük
+fprintf('\n--- Utófeldolgozás ---\n');
+tic;
+key_a  = [key_a{:}];
+key_b  = [key_b{:}];
+n_sift = numel(key_a);
+
+% ----- 1. Paraméterbecslés -----
+% A siftelt bitek véletlen részét nyilvánosan összevetik, majd eldobják.
+k_pe  = round(v_pe * n_sift); % a mintába kerülő bitek száma
+is_pe = false(1, n_sift); % a mintába kerülő bitek indexe
+is_pe(randperm(n_sift, k_pe)) = true; % a mintába kerülő bitek indexének a véletlen kiválasztása
+Q_k   = nnz(key_a(is_pe) ~= key_b(is_pe)) / max(k_pe, 1); % a mintában mért QBER
+ka    = key_a(~is_pe);  % a maradék siftelt bitek (Alice)
+kb    = key_b(~is_pe);  % a maradék siftelt bitek (Bob)
+n_pp  = numel(ka);      % utófeldolgozásra maradó bitek száma
+if k_pe == 0 || n_pp == 0 % túl kevés a siftelt bit, nincs kulcs
+    fprintf('Túl kevés a siftelt bit (%d), nincs kulcs.\n', n_sift);
+    return;
+end
+
+% Serfling-egyenlőtlenség: a maradék n bit a teljes N = n + k bit véletlen részhalmaza,
+% ezért P(Q_n >= Q_k + beta) <= exp(-2 n k^2 beta^2 / (N (k+1))). Ebből beta:
+beta = sqrt(n_sift * (k_pe + 1) * log(1/eps_pe) / (2 * n_pp * k_pe^2)); % a maradék QBER-jének felső korlátja a mintából becsülve
+Q_up  = min(Q_k + beta, 1); % kulcsbitek QBER-jének felső korlátja a mintából becsülve
+
+fprintf('1. Paraméterbecslés: %d siftelt bitből %d mintabit, %d marad\n', n_sift, k_pe, n_pp);
+fprintf('   Minta QBER: %.4f%% | felső korlát a maradékra (Serfling): %.4f%%\n', 100*Q_k, 100*Q_up);
+if Q_k > Q_tol
+    fprintf('   A minta QBER a %.2f%%-os küszöb fölött van: a protokoll leáll, nincs kulcs.\n', 100*Q_tol);
+    return;
+end
+
+% ----- 2-3. Hibajavítás (Cascade) és megerősítés, frame-enként -----
+n_frames   = ceil(n_pp / n_frame);  % a frame-ek száma a hibajavításnál
+kept       = false(1, n_pp);        % a megerősítésen átment bitek
+leak_kept  = 0;                     % a megtartott frame-ek nyilvános paritásbitjei
+n_kept     = 0;                     % a megtartott frame-ek száma
+n_err_pre  = nnz(ka ~= kb);         % a hibák száma a Cascade előtt
+for f = 1:n_frames
+    idx = (f-1)*n_frame + 1 : min(f*n_frame, n_pp); % az f-edik frame indexei
+    fa  = ka(idx);                  % a frame Alice-nál
+    fb  = kb(idx);                  % a frame Bobnál, ezt javítjuk
+    n_f = numel(idx);               % a frame hossza
+    if n_f == 0
+        % TODO: a frame lehet 0 hosszú?
+        continue;
+    end
+
+    % --- Cascade: Bob kijavítja fb-t Alice fa-jára ---
+    % Egy kör: véletlen keverés, blokkokra osztás, a páratlan blokkokban bináris
+    % kereséssel a hiba megkeresése. Cascade-hatás: a kijavított bit a korábbi körök
+    % blokkjainak paritását is megfordítja, így ott újabb hibák kereshetők meg.
+    % leak = a nyilvánosan elküldött paritásbitek száma. Az fa-t a kód csak a
+    % paritásokhoz olvassa, ezek mindegyike beleszámít a leak-be.
+    perm  = cell(1, n_pass);        % perm{p}: a p-edik kör keverése
+    pos   = cell(1, n_pass);        % pos{p}(i): az i-edik bit helye a keverés után
+    odd   = cell(1, n_pass);        % odd{p}(j): a j-edik blokk paritása eltér-e
+    k_blk = zeros(1, n_pass);       % blokkméret körönként: 0.73/Q_k, utána duplázódik
+    leak  = 0;
+
+    % egy kör: a blokkméret a mintában mért QBER alapján, majd minden körben duplázódik
+    for p = 1:n_pass
+        k_blk(p) = min(n_f, ceil(0.73/Q_k * 2^(p-1))); % a blokkméret nem lehet nagyobb a frame-nél
+        perm{p}  = randperm(n_f);       % véletlen sorrend
+        pos{p}(perm{p}) = 1:n_f;        % a keverés utáni pozíciók
+
+        n_blk  = ceil(n_f / k_blk(p));  % a blokkok száma, az utolsó blokk rövidebb lehet
+        diff_p = [fa(perm{p}) ~= fb(perm{p}), false(1, n_blk*k_blk(p) - n_f)];  % 1, ahol Alice és Bob bitje eltér,  false-al feltöltjük a paritás számoláshoz
+        odd{p} = mod(sum(reshape(diff_p, k_blk(p), n_blk), 1), 2) == 1;         % a blokkok paritása (true = páratlan)
+        leak   = leak + n_blk;      % minden blokk paritása nyilvános, ezért a leak-be számít
+
+        todo = [repmat(p, 1, nnz(odd{p})); find(odd{p})];    % javítandó (kör, blokk) párok
+        % amiíg van javítandó blokk, addig keresünk hibát bináris kereséssel
+        while ~isempty(todo)
+            % utolsó javítandó blokk: a kör és a blokkindex
+            % mindig a legutolsó blokkot javítjuk, mert az új hibák a korábbi blokkokban is lehetnek
+            pq  = todo(1,end);
+            blk = todo(2,end);
+            todo(:,end) = [];
+            if ~odd{pq}(blk)
+                continue;           % közben páros lett, a következő blokkot javítjuk
+            end
+
+            % bináris keresés: a bal fél paritásából a jobb felé is következik
+            ib = perm{pq}((blk-1)*k_blk(pq) + 1 : min(blk*k_blk(pq), n_f)); % a javítandó blokk indexei a keverés előtti frame-ben
+
+            % a blokkban páratlan sok hiba van
+            while numel(ib) > 1
+                fel  = floor(numel(ib) / 2);
+                % Alice elküldi a bal fél paritását, Bob kiszámolja a sajátját, és összevetik
+                leak = leak + 1;
+                % Ha a bal fél páratlan, akkor a hiba ott van, különben a jobb félben. A bal fél indexei: ib(1:fel)
+                if mod(nnz(fa(ib(1:fel)) ~= fb(ib(1:fel))), 2) == 1
+                    ib = ib(1:fel);
+                else
+                    ib = ib(fel+1:end);
+                end
+            end
+            % a blokkban egyetlen hiba maradt, azt kijavítjuk
+            fb(ib) = ~fb(ib);
+
+            % a javított bit minden eddigi kör blokkjának paritását megfordítja
+            for r = 1:p
+                % a javított bit a r-edik kör keverése után melyik blokkba esik
+                jb = ceil(pos{r}(ib) / k_blk(r));
+                % a blokk paritása megfordul, ha eddig páratlan volt, most páros lesz, és fordítva
+                odd{r}(jb) = ~odd{r}(jb);
+                if odd{r}(jb)
+                    % a blokk most páratlan, ezért újra kell keresni a hibát bináris kereséssel
+                    todo(:,end+1) = [r; jb]; %#ok<SAGROW>
+                end
+            end
+        end
+    end
+    % kijavított frame Bobnál
+    kb(idx) = fb;
+
+    % --- Megerősítés: mindketten kiszámolják ugyanannak a véletlen hash-nek a képét ---
+    % Kétuniverzális Toeplitz-hash: y = T x (mod 2)
+    % T egy t_conf x n_f-es véletlen Toeplitz-mátrix, T(i,j) = seed(i - j + n_f)
+    
+    % A hash hossza t_conf bit, a frame hossza n_f bit
+    % A seed hossza n_f + t_conf - 1 bit, a Toeplitz-mátrix minden átlója azonos
+    % A toeplitz(c, r) az első oszlopból (c) és az első sorból (r) építi fel a mátrixot:
+    %   c = seed(n_f : n_f+t_conf-1)   első oszlop, j = 1:  T(i,1) = seed(i - 1 + n_f)
+    %   r = seed(n_f : -1 : 1)         első sor,    i = 1:  T(1,j) = seed(1 - j + n_f)
+
+    % véletlen bitet sorsolunk a seed-hez, a seed hossza n_f + t_conf - 1, Alice és Bob ugyanazt használja, a seed nyilvános
+    % Minden frame-hez újat sorsol, a Cascade után
+    seed = rand(1, n_f + t_conf - 1) < 0.5;
+    % A Toeplitz-mátrixot a seed-ből építjük fel, majd a frame-eket hash-eljük
+    T    = toeplitz(double(seed(n_f : n_f+t_conf-1)), double(seed(n_f : -1 : 1)));
+    % A hash-elt kulcsok: Alice és Bob frame-jeit hash-eljük, majd összevetjük
+    hash = mod(T * double([fa(:), fb(:)]), 2) == 1;   % 1. oszlop: Alice hash-e, 2. oszlop: Bobé
+    if isequal(hash(:,1), hash(:,2))
+        kept(idx) = true;                   % a frame bitjei maradnak
+        leak_kept = leak_kept + leak;       % a nyilvános paritásbitek száma a megtartott frame-ekből
+        n_kept    = n_kept + 1;             % a megtartott frame-ek száma
+    end
+end
+% Alice kulcsa, Bob kulcsa, a megerősítésen átment bitek, a nyilvános paritásbitek száma
+ka = ka(kept);
+kb = kb(kept);
+n_rec = numel(ka);
+
+fprintf('2. Cascade: %d frame, %d kör, első blokkméret %d bit | %d hiba volt a maradékban\n', ...
+    n_frames, n_pass, min(n_frame, ceil(0.73/Q_k)), n_err_pre);
+fprintf('3. Megerősítés (%d bites hash): %d/%d frame maradt, %d bit | észrevétlen hiba: %d\n', ...
+    t_conf, n_kept, n_frames, n_rec, nnz(ka ~= kb));
+if n_rec == 0
+    fprintf('   Egy frame sem ment át a megerősítésen, nincs kulcs.\n');
+    return;
+end
+
+% ----- Egyeztetett kulcs (titkosságerősítés nélkül) -----
+% A hibajavítás és a megerősítés utáni közös kulcs. Ez még NEM titkos: Eve ismerheti
+% egy részét (kvantumcsatorna) és látta a nyilvános paritás- és hash-biteket.
+T_real = N_total / f_rep;
+fprintf('\n--- Egyeztetett kulcs (titkosságerősítés nélkül) ---\n');
+fprintf('Siftelt %d -> becslés után %d -> megerősítés után %d bit\n', n_sift, n_pp, n_rec);
+fprintf('Egyeztetett kulcsráta: %.4g bit/s | nyilvános bitek: %d paritás + %d hash (%.2f%%)\n', ...
+    n_rec/T_real, leak_kept, t_conf*n_kept, 100*(leak_kept + t_conf*n_kept)/n_rec);
+fprintf('Alice és Bob kulcsa azonos: %d | Bias: P(0) = %.6f\n', isequal(ka, kb), mean(~ka));
+fprintf('Utófeldolgozás futásideje: %.1f s\n', toc);
